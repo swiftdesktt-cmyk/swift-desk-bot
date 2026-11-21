@@ -9,22 +9,59 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "swiftdesk_verify_2026";
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || "1401333586405626";
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-const SYSTEM_PROMPT = `
-You are the 24/7 AI receptionist for Swift Desk TT in Trinidad and Tobago.
-Keep replies concise, friendly, and helpful for WhatsApp.
-Quote prices in TTD when asked about packages, and end with one clear qualifying question.
+const RECEPTIONIST_SYSTEM_INSTRUCTION = `
+You are Swift Desk TT, a 24/7 AI receptionist for businesses in Trinidad and Tobago.
+Be polite, clear, and concise so responses read naturally on WhatsApp.
+Share pricing in TTD when asked about plans or packages, and close with one helpful follow-up question.
 `.trim();
 
-async function sendWhatsAppReply(to, text) {
-  if (!WHATSAPP_TOKEN) {
-    throw new Error("Missing WHATSAPP_TOKEN environment variable");
+async function generateReceptionistReply(userMessage, maxRetries = 2) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: userMessage,
+        config: {
+          systemInstruction: RECEPTIONIST_SYSTEM_INSTRUCTION,
+        },
+      });
+
+      const reply = response.text?.trim();
+      if (reply) {
+        return reply;
+      }
+    } catch (error) {
+      const status = error?.status ?? error?.code;
+      const message = String(error?.message || "");
+      const isTemporarySpike =
+        status === 503 || status === 429 || message.includes("UNAVAILABLE");
+
+      if (!isTemporarySpike || attempt === maxRetries) {
+        throw error;
+      }
+
+      const waitMs = 1200 * (attempt + 1);
+      console.warn(
+        `Gemini temporarily busy (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${waitMs}ms...`
+      );
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
   }
 
-  const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
-  const response = await fetch(url, {
+  return "Thanks for messaging Swift Desk TT! How can I help your business today?";
+}
+
+async function sendWhatsAppMessage(recipientPhone, bodyText) {
+  if (!WHATSAPP_TOKEN) {
+    throw new Error("WHATSAPP_TOKEN is not set in environment variables");
+  }
+
+  const endpoint = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
+  const res = await fetch(endpoint, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${WHATSAPP_TOKEN}`,
@@ -32,15 +69,15 @@ async function sendWhatsAppReply(to, text) {
     },
     body: JSON.stringify({
       messaging_product: "whatsapp",
-      to,
+      to: recipientPhone,
       type: "text",
-      text: { body: text },
+      text: { body: bodyText },
     }),
   });
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`WhatsApp API error (${response.status}): ${errorBody}`);
+  if (!res.ok) {
+    const details = await res.text();
+    throw new Error(`WhatsApp send failed (${res.status}): ${details}`);
   }
 }
 
@@ -61,18 +98,16 @@ app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
 
   try {
-    const entry = req.body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-    const incomingPhoneNumberId = value?.metadata?.phone_number_id;
-    const message = value?.messages?.[0];
+    const changeValue = req.body?.entry?.[0]?.changes?.[0]?.value;
+    const incomingPhoneId = changeValue?.metadata?.phone_number_id;
+    const message = changeValue?.messages?.[0];
 
     if (!message) {
       return;
     }
 
-    if (incomingPhoneNumberId !== PHONE_NUMBER_ID) {
-      console.log(`Unconfigured Phone Number ID: ${incomingPhoneNumberId}`);
+    if (incomingPhoneId !== PHONE_NUMBER_ID) {
+      console.log(`Unconfigured Phone Number ID: ${incomingPhoneId}`);
       return;
     }
 
@@ -83,19 +118,12 @@ app.post("/webhook", async (req, res) => {
     const senderPhone = message.from;
     const incomingText = message.text.body.trim();
 
-    const aiResponse = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: incomingText,
-      config: {
-        systemInstruction: SYSTEM_PROMPT,
-      },
-    });
+    console.log(`Incoming message from ${senderPhone}: ${incomingText}`);
 
-    const replyText =
-      aiResponse.text?.trim() ||
-      "Thanks for reaching out to Swift Desk TT! How can I help you today?";
+    const replyText = await generateReceptionistReply(incomingText);
+    await sendWhatsAppMessage(senderPhone, replyText);
 
-    await sendWhatsAppReply(senderPhone, replyText);
+    console.log(`Reply sent to ${senderPhone}`);
   } catch (error) {
     console.error("Error processing webhook:", error);
   }
